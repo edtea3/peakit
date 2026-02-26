@@ -36,8 +36,8 @@ def _env_bool(key: str, default: bool) -> bool:
     return default
 
 
-SYNC_PARSE_ON_ADD = _env_bool("SYNC_PARSE_ON_ADD", False)
-SYNC_REFRESH_BEFORE_THREATS_EXPORT = _env_bool("SYNC_REFRESH_BEFORE_THREATS_EXPORT", False)
+SYNC_PARSE_ON_ADD = _env_bool("SYNC_PARSE_ON_ADD", True)
+SYNC_REFRESH_BEFORE_THREATS_EXPORT = _env_bool("SYNC_REFRESH_BEFORE_THREATS_EXPORT", True)
 
 
 

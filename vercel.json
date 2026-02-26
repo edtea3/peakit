@@ -1,0 +1,18 @@
+{
+  "routes": [
+    {
+      "src": "/api/telegram",
+      "dest": "api/telegram.py"
+    },
+    {
+      "src": "/api/cron",
+      "dest": "api/cron.py"
+    }
+  ],
+  "crons": [
+    {
+      "path": "/api/cron",
+      "schedule": "0 3 * * *"
+    }
+  ]
+}

@@ -47,19 +47,8 @@ async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.exception("Unhandled bot error", exc_info=context.error)
 
 
-def run() -> None:
-    settings = Settings()
-    settings.validate()
-
+def build_application(settings: Settings, storage: SupabaseStorage) -> Application:
     app = Application.builder().token(settings.telegram_bot_token).build()
-    storage = SupabaseStorage(
-        url=settings.supabase_url,
-        key=settings.supabase_key,
-        timeout_s=settings.supabase_timeout_s,
-        ssl_verify=settings.supabase_ssl_verify,
-        ca_bundle=settings.supabase_ca_bundle,
-    )
-    storage.sync_threat_categories()
     app.bot_data["storage"] = storage
 
     conv = ConversationHandler(
@@ -113,4 +102,23 @@ def run() -> None:
     app.add_handler(export_conv)
     app.add_handler(analytics_conv)
     app.add_error_handler(_on_error)
+    return app
+
+
+def _build_storage(settings: Settings) -> SupabaseStorage:
+    return SupabaseStorage(
+        url=settings.supabase_url,
+        key=settings.supabase_key,
+        timeout_s=settings.supabase_timeout_s,
+        ssl_verify=settings.supabase_ssl_verify,
+        ca_bundle=settings.supabase_ca_bundle,
+    )
+
+
+def run() -> None:
+    settings = Settings()
+    settings.validate()
+    storage = _build_storage(settings)
+    storage.sync_threat_categories()
+    app = build_application(settings=settings, storage=storage)
     app.run_polling()

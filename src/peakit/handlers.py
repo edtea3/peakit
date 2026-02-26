@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 from datetime import UTC, datetime, timedelta
 from io import StringIO
+import os
 import re
 from typing import Any
 
@@ -21,6 +22,22 @@ WAIT_EXPORT_CHANNELS = 10
 WAIT_EXPORT_PERIOD = 11
 WAIT_EXPORT_TYPES = 12
 WAIT_ANALYTICS_PERIOD = 20
+
+
+def _env_bool(key: str, default: bool) -> bool:
+    raw = os.getenv(key)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+SYNC_PARSE_ON_ADD = _env_bool("SYNC_PARSE_ON_ADD", False)
+SYNC_REFRESH_BEFORE_THREATS_EXPORT = _env_bool("SYNC_REFRESH_BEFORE_THREATS_EXPORT", False)
 
 
 
@@ -390,9 +407,7 @@ async def _save_handles(
     failed_count = len(invalid)
     errors: list[str] = []
 
-    progress_msg = await update.message.reply_text(
-        f"{_progress_bar(0, len(handles))} 0/{len(handles)}"
-    )
+    progress_msg = await update.message.reply_text(f"{_progress_bar(0, len(handles))} 0/{len(handles)}")
 
     total = len(handles)
 
@@ -405,15 +420,17 @@ async def _save_handles(
             channel_ok = False
             channel_row = None
 
-        if channel_ok:
+        if channel_ok and SYNC_PARSE_ON_ADD:
             try:
                 parsed = parse_channel_last_days(handle=handle, days=7)
             except ParseError as exc:
                 errors.append(f"{handle}: parse error: {exc}")
                 channel_ok = False
                 parsed = []
+        else:
+            parsed = []
 
-        if channel_ok and channel_row is not None:
+        if channel_ok and channel_row is not None and SYNC_PARSE_ON_ADD:
             try:
                 storage.upsert_posts(
                     channel_id=int(channel_row.get("id")),
@@ -433,7 +450,7 @@ async def _save_handles(
                 errors.append(f"{handle}: post save error: {exc}")
                 channel_ok = False
 
-        if channel_ok and channel_row is not None:
+        if channel_ok and channel_row is not None and SYNC_PARSE_ON_ADD:
             try:
                 unchecked_posts = storage.list_unchecked_posts(channel_id=int(channel_row.get("id")), limit=10000)
             except StorageError as exc:
@@ -490,6 +507,8 @@ async def _save_handles(
         f"Успешно добавлено каналов: {success_count}",
         f"Неуспешно: {failed_count}",
     ]
+    if not SYNC_PARSE_ON_ADD:
+        lines.append("Парсинг и детект выполняются отдельно: кнопкой 'Обновить данные' или по cron.")
     if errors:
         lines.append(f"ошибки (первые 3): {' | '.join(errors[:3])}")
 
@@ -671,14 +690,15 @@ async def on_export_threats_types(update: Update, context: ContextTypes.DEFAULT_
     progress = await update.message.reply_text(f"{_progress_bar(0, 4)} 0/4")
 
     errors: list[str] = []
-    for ch in channels:
-        ok, err = await _refresh_and_detect_for_channel(
-            storage=storage,
-            handle=str(ch.get("handle")),
-            channel_id=int(ch.get("id")),
-        )
-        if not ok and err:
-            errors.append(err)
+    if SYNC_REFRESH_BEFORE_THREATS_EXPORT:
+        for ch in channels:
+            ok, err = await _refresh_and_detect_for_channel(
+                storage=storage,
+                handle=str(ch.get("handle")),
+                channel_id=int(ch.get("id")),
+            )
+            if not ok and err:
+                errors.append(err)
     await _safe_progress_edit(progress, f"{_progress_bar(1, 4)} 1/4")
 
     channel_ids = [int(ch.get("id")) for ch in channels]

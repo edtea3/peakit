@@ -15,7 +15,7 @@ from .parser import ParseError, parse_channel_last_days
 from .storage import StorageError, SupabaseStorage
 from .threat_categories import CATEGORY_RU_TO_EN, CANONICAL_CATEGORY_LABELS_RU, THREAT_TYPE_RU_OPTIONS
 from .threat_detector import ThreatDetectorError, detect_threat_rows
-from .ui import BTN_ALERTS, main_keyboard
+from .ui import BTN_ADD_CHANNEL, BTN_ALERTS, BTN_ANALYTICS, BTN_EXPORT_THREATS, BTN_LIST_CHANNELS, main_keyboard
 
 WAIT_CHANNEL = 1
 WAIT_EXPORT_CHANNELS = 10
@@ -45,6 +45,14 @@ def _env_bool(key: str, default: bool) -> bool:
 SYNC_PARSE_ON_ADD = _env_bool("SYNC_PARSE_ON_ADD", True)
 SYNC_REFRESH_BEFORE_THREATS_EXPORT = _env_bool("SYNC_REFRESH_BEFORE_THREATS_EXPORT", True)
 ALERTS_ENABLED = _env_bool("ALERTS_ENABLED", False)
+
+MAIN_MENU_BUTTONS = {
+    BTN_ADD_CHANNEL,
+    BTN_LIST_CHANNELS,
+    BTN_EXPORT_THREATS,
+    BTN_ANALYTICS,
+    BTN_ALERTS,
+}
 
 
 
@@ -739,7 +747,12 @@ async def on_channel_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not update.message:
         return WAIT_CHANNEL
 
-    handles, invalid = _extract_handles_batch(update.message.text or "")
+    text = (update.message.text or "").strip()
+    if text in MAIN_MENU_BUTTONS:
+        await update.message.reply_text("Режим добавления каналов завершен.", reply_markup=main_keyboard())
+        return ConversationHandler.END
+
+    handles, invalid = _extract_handles_batch(text)
     if not handles:
         await update.message.reply_text("Не нашел валидных каналов. Пример: @channel или https://t.me/channel")
         return WAIT_CHANNEL

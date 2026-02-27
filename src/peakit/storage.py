@@ -239,12 +239,23 @@ class SupabaseStorage:
     def upsert_threats(self, threats: list[dict]) -> int:
         if not threats:
             return 0
+        # Supabase/Postgres cannot upsert two rows with same conflict key in one statement.
+        deduped: dict[tuple[str, str, str, str], dict] = {}
+        for row in threats:
+            key = (
+                str(row.get("post_id")),
+                str(row.get("threat_type")),
+                str(row.get("detector_name")),
+                str(row.get("detector_version")),
+            )
+            deduped[key] = row
+        payload = list(deduped.values())
 
         query = urlencode({"on_conflict": "post_id,threat_type,detector_name,detector_version"})
         endpoint = f"{self.url}/rest/v1/post_threats?{query}"
         req = Request(
             endpoint,
-            data=json.dumps(threats).encode("utf-8"),
+            data=json.dumps(payload).encode("utf-8"),
             method="POST",
             headers={
                 "apikey": self.key,

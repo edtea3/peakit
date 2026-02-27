@@ -489,3 +489,267 @@ class SupabaseStorage:
                 raise StorageError(f"Supabase unexpected threats-by-posts response: {rows}")
             out.extend(dict(row) for row in rows)
         return out
+
+    def get_or_create_alert_rule(self, chat_id: int, created_by: str | None = None) -> dict:
+        query = urlencode(
+            {
+                "select": "id,chat_id,target_chat,is_active,min_score,threat_types,channels_mode,channel_handles,cooldown_minutes,auto_monitor_interval_min,created_at,updated_at",
+                "chat_id": f"eq.{int(chat_id)}",
+                "limit": "1",
+            }
+        )
+        endpoint = f"{self.url}/rest/v1/alert_rules?{query}"
+        req = Request(
+            endpoint,
+            method="GET",
+            headers={
+                "apikey": self.key,
+                "Authorization": f"Bearer {self.key}",
+                "Accept": "application/json",
+            },
+        )
+        try:
+            with urlopen(req, timeout=self.timeout_s, context=self._ssl_context()) as resp:
+                raw = resp.read().decode("utf-8")
+            rows = json.loads(raw)
+        except HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise StorageError(f"Supabase HTTP {exc.code}: {body}") from exc
+        except URLError as exc:
+            raise StorageError(f"Supabase network error: {exc}") from exc
+        except json.JSONDecodeError as exc:
+            raise StorageError(f"Supabase bad JSON response: {raw}") from exc
+
+        if isinstance(rows, list) and rows:
+            return dict(rows[0])
+
+        payload = {
+            "chat_id": int(chat_id),
+            "target_chat": str(chat_id),
+            "is_active": False,
+            "min_score": 0.5,
+            "threat_types": None,
+            "channels_mode": "all",
+            "channel_handles": None,
+            "cooldown_minutes": 0,
+            "auto_monitor_interval_min": None,
+            "created_by": created_by,
+        }
+        endpoint = f"{self.url}/rest/v1/alert_rules?{urlencode({'on_conflict': 'chat_id'})}"
+        req = Request(
+            endpoint,
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={
+                "apikey": self.key,
+                "Authorization": f"Bearer {self.key}",
+                "Content-Type": "application/json",
+                "Prefer": "resolution=merge-duplicates,return=representation",
+            },
+        )
+        try:
+            with urlopen(req, timeout=self.timeout_s, context=self._ssl_context()) as resp:
+                raw = resp.read().decode("utf-8")
+            rows = json.loads(raw)
+        except HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise StorageError(f"Supabase HTTP {exc.code}: {body}") from exc
+        except URLError as exc:
+            raise StorageError(f"Supabase network error: {exc}") from exc
+        except json.JSONDecodeError as exc:
+            raise StorageError(f"Supabase bad JSON response: {raw}") from exc
+        if not isinstance(rows, list) or not rows:
+            raise StorageError(f"Supabase empty alert rule response: {rows}")
+        return dict(rows[0])
+
+    def update_alert_rule(self, chat_id: int, patch: dict) -> dict:
+        endpoint = f"{self.url}/rest/v1/alert_rules?chat_id=eq.{int(chat_id)}"
+        req = Request(
+            endpoint,
+            data=json.dumps(patch).encode("utf-8"),
+            method="PATCH",
+            headers={
+                "apikey": self.key,
+                "Authorization": f"Bearer {self.key}",
+                "Content-Type": "application/json",
+                "Prefer": "return=representation",
+            },
+        )
+        try:
+            with urlopen(req, timeout=self.timeout_s, context=self._ssl_context()) as resp:
+                raw = resp.read().decode("utf-8")
+            rows = json.loads(raw)
+        except HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise StorageError(f"Supabase HTTP {exc.code}: {body}") from exc
+        except URLError as exc:
+            raise StorageError(f"Supabase network error: {exc}") from exc
+        except json.JSONDecodeError as exc:
+            raise StorageError(f"Supabase bad JSON response: {raw}") from exc
+        if not isinstance(rows, list) or not rows:
+            return self.get_or_create_alert_rule(chat_id=chat_id)
+        return dict(rows[0])
+
+    def list_active_alert_rules(self) -> list[dict]:
+        query = urlencode(
+            {
+                "select": "id,chat_id,target_chat,is_active,min_score,threat_types,channels_mode,channel_handles,cooldown_minutes,auto_monitor_interval_min",
+                "is_active": "eq.true",
+                "order": "id.asc",
+            }
+        )
+        endpoint = f"{self.url}/rest/v1/alert_rules?{query}"
+        req = Request(
+            endpoint,
+            method="GET",
+            headers={
+                "apikey": self.key,
+                "Authorization": f"Bearer {self.key}",
+                "Accept": "application/json",
+            },
+        )
+        try:
+            with urlopen(req, timeout=self.timeout_s, context=self._ssl_context()) as resp:
+                raw = resp.read().decode("utf-8")
+            rows = json.loads(raw)
+        except HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise StorageError(f"Supabase HTTP {exc.code}: {body}") from exc
+        except URLError as exc:
+            raise StorageError(f"Supabase network error: {exc}") from exc
+        except json.JSONDecodeError as exc:
+            raise StorageError(f"Supabase bad JSON response: {raw}") from exc
+        if not isinstance(rows, list):
+            raise StorageError(f"Supabase unexpected alert rules response: {rows}")
+        return [dict(row) for row in rows]
+
+    def get_latest_auto_monitor_interval(self) -> int | None:
+        query = urlencode(
+            {
+                "select": "auto_monitor_interval_min",
+                "auto_monitor_interval_min": "not.is.null",
+                "order": "updated_at.desc",
+                "limit": "1",
+            }
+        )
+        endpoint = f"{self.url}/rest/v1/alert_rules?{query}"
+        req = Request(
+            endpoint,
+            method="GET",
+            headers={
+                "apikey": self.key,
+                "Authorization": f"Bearer {self.key}",
+                "Accept": "application/json",
+            },
+        )
+        try:
+            with urlopen(req, timeout=self.timeout_s, context=self._ssl_context()) as resp:
+                raw = resp.read().decode("utf-8")
+            rows = json.loads(raw)
+        except HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise StorageError(f"Supabase HTTP {exc.code}: {body}") from exc
+        except URLError as exc:
+            raise StorageError(f"Supabase network error: {exc}") from exc
+        except json.JSONDecodeError as exc:
+            raise StorageError(f"Supabase bad JSON response: {raw}") from exc
+        if not isinstance(rows, list) or not rows:
+            return None
+        value = rows[0].get("auto_monitor_interval_min")
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except Exception:
+            return None
+
+    def is_rule_in_cooldown(self, rule_id: int, cooldown_minutes: int) -> bool:
+        if cooldown_minutes <= 0:
+            return False
+        query = urlencode(
+            {
+                "select": "sent_at",
+                "rule_id": f"eq.{int(rule_id)}",
+                "order": "sent_at.desc",
+                "limit": "1",
+            }
+        )
+        endpoint = f"{self.url}/rest/v1/alert_events?{query}"
+        req = Request(
+            endpoint,
+            method="GET",
+            headers={
+                "apikey": self.key,
+                "Authorization": f"Bearer {self.key}",
+                "Accept": "application/json",
+            },
+        )
+        try:
+            with urlopen(req, timeout=self.timeout_s, context=self._ssl_context()) as resp:
+                raw = resp.read().decode("utf-8")
+            rows = json.loads(raw)
+        except HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise StorageError(f"Supabase HTTP {exc.code}: {body}") from exc
+        except URLError as exc:
+            raise StorageError(f"Supabase network error: {exc}") from exc
+        except json.JSONDecodeError as exc:
+            raise StorageError(f"Supabase bad JSON response: {raw}") from exc
+        if not isinstance(rows, list) or not rows:
+            return False
+        ts = rows[0].get("sent_at")
+        if not ts:
+            return False
+        try:
+            dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=UTC)
+            age_s = (datetime.now(UTC) - dt.astimezone(UTC)).total_seconds()
+        except Exception:
+            return False
+        return age_s < cooldown_minutes * 60
+
+    def create_alert_event(
+        self,
+        rule_id: int,
+        post_id: int,
+        threat_type: str,
+        detector_name: str,
+        detector_version: str,
+        score: float,
+    ) -> bool:
+        payload = {
+            "rule_id": int(rule_id),
+            "post_id": int(post_id),
+            "threat_type": threat_type,
+            "detector_name": detector_name,
+            "detector_version": detector_version,
+            "score": float(score),
+        }
+        query = urlencode({"on_conflict": "rule_id,post_id,threat_type,detector_name,detector_version"})
+        endpoint = f"{self.url}/rest/v1/alert_events?{query}"
+        req = Request(
+            endpoint,
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={
+                "apikey": self.key,
+                "Authorization": f"Bearer {self.key}",
+                "Content-Type": "application/json",
+                "Prefer": "resolution=ignore-duplicates,return=representation",
+            },
+        )
+        try:
+            with urlopen(req, timeout=self.timeout_s, context=self._ssl_context()) as resp:
+                raw = resp.read().decode("utf-8")
+            rows = json.loads(raw)
+        except HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise StorageError(f"Supabase HTTP {exc.code}: {body}") from exc
+        except URLError as exc:
+            raise StorageError(f"Supabase network error: {exc}") from exc
+        except json.JSONDecodeError as exc:
+            raise StorageError(f"Supabase bad JSON response: {raw}") from exc
+        if not isinstance(rows, list):
+            raise StorageError(f"Supabase unexpected alert event response: {rows}")
+        return len(rows) > 0

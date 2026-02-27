@@ -15,13 +15,19 @@ from .parser import ParseError, parse_channel_last_days
 from .storage import StorageError, SupabaseStorage
 from .threat_categories import CATEGORY_RU_TO_EN, CANONICAL_CATEGORY_LABELS_RU, THREAT_TYPE_RU_OPTIONS
 from .threat_detector import ThreatDetectorError, detect_threat_rows
-from .ui import main_keyboard
+from .ui import BTN_ALERTS, main_keyboard
 
 WAIT_CHANNEL = 1
 WAIT_EXPORT_CHANNELS = 10
 WAIT_EXPORT_PERIOD = 11
 WAIT_EXPORT_TYPES = 12
 WAIT_ANALYTICS_PERIOD = 20
+WAIT_ALERT_ACTION = 30
+WAIT_ALERT_SCORE = 31
+WAIT_ALERT_TYPES = 32
+WAIT_ALERT_CHANNELS = 33
+WAIT_ALERT_INTERVAL = 34
+WAIT_ALERT_TARGET = 35
 
 
 def _env_bool(key: str, default: bool) -> bool:
@@ -38,6 +44,7 @@ def _env_bool(key: str, default: bool) -> bool:
 
 SYNC_PARSE_ON_ADD = _env_bool("SYNC_PARSE_ON_ADD", True)
 SYNC_REFRESH_BEFORE_THREATS_EXPORT = _env_bool("SYNC_REFRESH_BEFORE_THREATS_EXPORT", True)
+ALERTS_ENABLED = _env_bool("ALERTS_ENABLED", False)
 
 
 
@@ -132,6 +139,137 @@ def _threat_types_keyboard() -> ReplyKeyboardMarkup:
     if row:
         rows.append(row)
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=True)
+
+
+def _alerts_menu_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("Статус"), KeyboardButton("Включить")],
+            [KeyboardButton("Выключить"), KeyboardButton("Порог")],
+            [KeyboardButton("Типы"), KeyboardButton("Каналы")],
+            [KeyboardButton("Интервал автообновления"), KeyboardButton("Куда отправлять")],
+            [KeyboardButton("Назад")],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def _format_alert_rule(rule: dict[str, Any]) -> str:
+    active = "включен" if bool(rule.get("is_active")) else "выключен"
+    min_score = float(rule.get("min_score") or 0.0)
+    cooldown = int(rule.get("cooldown_minutes") or 0)
+    channels_mode = str(rule.get("channels_mode") or "all")
+    channels = rule.get("channel_handles") or []
+    threat_types = rule.get("threat_types") or []
+    interval = rule.get("auto_monitor_interval_min")
+    target_chat = str(rule.get("target_chat") or rule.get("chat_id") or "")
+    types_ru = [CANONICAL_CATEGORY_LABELS_RU.get(str(x), str(x)) for x in threat_types]
+    channels_text = "все" if channels_mode == "all" else (", ".join(channels) if channels else "список пуст")
+    types_text = "все" if not threat_types else ", ".join(types_ru)
+    return "\n".join(
+        [
+            "Настройки алерта:",
+            f"Статус: {active}",
+            f"Порог score: {min_score:.2f}",
+            f"Cooldown: {cooldown} мин",
+            f"Интервал автообновления: {interval if interval is not None else '-'} мин",
+            f"Куда отправлять: {target_chat}",
+            f"Каналы: {channels_text}",
+            f"Типы: {types_text}",
+        ]
+    )
+
+
+def _rule_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(x).strip().lower() for x in value if str(x).strip()]
+    return []
+
+
+def _alert_rule_matches(rule: dict[str, Any], threat: dict[str, Any], source_handle: str) -> bool:
+    score = float(threat.get("score") or 0.0)
+    if score < float(rule.get("min_score") or 0.0):
+        return False
+    allowed_types = _rule_list(rule.get("threat_types"))
+    if allowed_types:
+        tt = str(threat.get("threat_type") or "").lower()
+        if tt not in allowed_types:
+            return False
+    channels_mode = str(rule.get("channels_mode") or "all").lower()
+    if channels_mode == "list":
+        handles = _rule_list(rule.get("channel_handles"))
+        if handles and source_handle.lower() not in handles:
+            return False
+    return True
+
+
+async def _dispatch_alerts(
+    storage: SupabaseStorage,
+    bot: Any,
+    threats: list[dict[str, Any]],
+    post_by_id: dict[int, dict[str, Any]],
+) -> None:
+    if not ALERTS_ENABLED or not threats:
+        return
+    rules = storage.list_active_alert_rules()
+    if not rules:
+        return
+    grouped: dict[tuple[int, int], dict[str, Any]] = {}
+    for threat in threats:
+        post_id = int(threat.get("post_id") or 0)
+        post = post_by_id.get(post_id) or {}
+        source_handle = str(post.get("source_handle") or "")
+        for rule in rules:
+            if not _alert_rule_matches(rule, threat, source_handle):
+                continue
+            key = (int(rule.get("id")), post_id)
+            entry = grouped.setdefault(
+                key,
+                {
+                    "rule": rule,
+                    "post": post,
+                    "types": set(),
+                    "max_score": 0.0,
+                },
+            )
+            tt = str(threat.get("threat_type") or "")
+            entry["types"].add(tt)
+            entry["max_score"] = max(float(entry["max_score"]), float(threat.get("score") or 0.0))
+
+    for (rule_id, post_id), entry in grouped.items():
+        rule = entry["rule"]
+        post = entry["post"]
+        cooldown = int(rule.get("cooldown_minutes") or 0)
+        if cooldown > 0 and storage.is_rule_in_cooldown(rule_id=rule_id, cooldown_minutes=cooldown):
+            continue
+        created = storage.create_alert_event(
+            rule_id=rule_id,
+            post_id=post_id,
+            threat_type="__post__",
+            detector_name="aggregate",
+            detector_version="1",
+            score=float(entry["max_score"]),
+        )
+        if not created:
+            continue
+        source_handle = str(post.get("source_handle") or "")
+        type_labels = [CANONICAL_CATEGORY_LABELS_RU.get(tt, tt) for tt in sorted(entry["types"])]
+        text = (
+            "Алерт: новая угроза\n"
+            f"Канал: @{source_handle}\n"
+            f"Типы: {', '.join(type_labels)}\n"
+            f"Max score: {float(entry['max_score']):.2f}\n"
+            f"Пост: {post.get('post_url') or '-'}\n"
+            f"Текст: {(post.get('content') or '')[:200]}"
+        )
+        try:
+            target_chat = str(rule.get("target_chat") or rule.get("chat_id") or "").strip()
+            chat_arg: Any = target_chat
+            if target_chat.lstrip("-").isdigit():
+                chat_arg = int(target_chat)
+            await bot.send_message(chat_id=chat_arg, text=text)
+        except Exception:
+            continue
 
 
 def _to_date_iso(value: str | None) -> str:
@@ -253,6 +391,7 @@ async def _refresh_and_detect_for_channel(
     storage: SupabaseStorage,
     handle: str,
     channel_id: int,
+    bot: Any | None = None,
 ) -> tuple[bool, str | None]:
     try:
         last_post_date = storage.get_last_post_date(channel_id=channel_id)
@@ -300,9 +439,11 @@ async def _refresh_and_detect_for_channel(
 
     all_threats: list[dict] = []
     checked_post_ids: list[int] = []
+    post_by_id: dict[int, dict[str, Any]] = {}
     for post in unchecked_posts:
         post_id = int(post.get("id"))
         checked_post_ids.append(post_id)
+        post_by_id[post_id] = dict(post)
         try:
             rows = detect_threat_rows(
                 post_id=post_id,
@@ -323,6 +464,13 @@ async def _refresh_and_detect_for_channel(
         storage.upsert_threats(all_threats)
     except StorageError as exc:
         return False, f"{handle}: threat save error: {exc}"
+
+    if bot is not None:
+        try:
+            await _dispatch_alerts(storage=storage, bot=bot, threats=all_threats, post_by_id=post_by_id)
+        except StorageError:
+            # Alerts should not fail the refresh pipeline.
+            pass
 
     try:
         storage.mark_posts_risk_checked(checked_post_ids)
@@ -372,7 +520,12 @@ async def on_refresh_data(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     for i, ch in enumerate(channels, start=1):
         handle = str(ch.get("handle") or "")
         channel_id = int(ch.get("id"))
-        ok, err = await _refresh_and_detect_for_channel(storage=storage, handle=handle, channel_id=channel_id)
+        ok, err = await _refresh_and_detect_for_channel(
+            storage=storage,
+            handle=handle,
+            channel_id=channel_id,
+            bot=context.bot,
+        )
         if ok:
             ok_count += 1
         else:
@@ -389,6 +542,59 @@ async def on_refresh_data(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if errors:
         lines.append(f"Ошибки (первые 5): {' | '.join(errors[:5])}")
     await update.message.reply_text("\n".join(lines), reply_markup=main_keyboard())
+
+
+async def run_refresh_cycle(storage: SupabaseStorage, bot: Any | None = None) -> dict[str, Any]:
+    channels = [c for c in storage.list_channels() if bool(c.get("is_active", True))]
+    ok_count = 0
+    fail_count = 0
+    errors: list[str] = []
+
+    for ch in channels:
+        handle = str(ch.get("handle") or "")
+        channel_id = int(ch.get("id"))
+        ok, err = await _refresh_and_detect_for_channel(
+            storage=storage,
+            handle=handle,
+            channel_id=channel_id,
+            bot=bot,
+        )
+        if ok:
+            ok_count += 1
+        else:
+            fail_count += 1
+            if err:
+                errors.append(err)
+
+    return {
+        "total": len(channels),
+        "ok": ok_count,
+        "failed": fail_count,
+        "errors": errors,
+    }
+
+
+async def auto_monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    storage = context.application.bot_data.get("storage")
+    if not isinstance(storage, SupabaseStorage):
+        return
+    await run_refresh_cycle(storage=storage, bot=context.bot)
+
+
+def register_auto_monitor_job(application: Any, interval_min: int) -> None:
+    if application.job_queue is None:
+        return
+    interval = max(1, int(interval_min))
+    for job in application.job_queue.get_jobs_by_name("auto_monitor_refresh"):
+        job.schedule_removal()
+    application.job_queue.run_repeating(
+        auto_monitor_job,
+        interval=timedelta(minutes=interval),
+        first=timedelta(seconds=30),
+        name="auto_monitor_refresh",
+        job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 60},
+    )
+    application.bot_data["auto_monitor_interval_min"] = interval
 
 
 async def _save_handles(
@@ -461,9 +667,11 @@ async def _save_handles(
             if channel_ok:
                 all_threats: list[dict] = []
                 checked_post_ids: list[int] = []
+                post_by_id: dict[int, dict[str, Any]] = {}
                 for post in unchecked_posts:
                     post_id = int(post.get("id"))
                     checked_post_ids.append(post_id)
+                    post_by_id[post_id] = dict(post)
                     try:
                         threat_rows = detect_threat_rows(
                             post_id=post_id,
@@ -487,6 +695,17 @@ async def _save_handles(
                 except StorageError as exc:
                     errors.append(f"{handle}: threat save error: {exc}")
                     channel_ok = False
+
+                if channel_ok:
+                    try:
+                        await _dispatch_alerts(
+                            storage=storage,
+                            bot=context.bot,
+                            threats=all_threats,
+                            post_by_id=post_by_id,
+                        )
+                    except StorageError:
+                        pass
 
                 if channel_ok:
                     try:
@@ -696,6 +915,7 @@ async def on_export_threats_types(update: Update, context: ContextTypes.DEFAULT_
                 storage=storage,
                 handle=str(ch.get("handle")),
                 channel_id=int(ch.get("id")),
+                bot=context.bot,
             )
             if not ok and err:
                 errors.append(err)
@@ -775,6 +995,206 @@ async def on_export_threats_types(update: Update, context: ContextTypes.DEFAULT_
     if errors:
         await update.message.reply_text(f"Ошибки обновления (первые 5): {' | '.join(errors[:5])}")
     return ConversationHandler.END
+
+
+async def on_alerts_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message:
+        return WAIT_ALERT_ACTION
+    if not ALERTS_ENABLED:
+        await update.message.reply_text(
+            "Алерты отключены. Включите ALERTS_ENABLED=true в .env и перезапустите бота.",
+            reply_markup=main_keyboard(),
+        )
+        return ConversationHandler.END
+    storage = context.bot_data.get("storage")
+    if not isinstance(storage, SupabaseStorage):
+        await update.message.reply_text("Ошибка: хранилище не инициализировано")
+        return ConversationHandler.END
+    created_by = str(update.effective_user.id) if update.effective_user else None
+    try:
+        rule = storage.get_or_create_alert_rule(chat_id=update.effective_chat.id, created_by=created_by)
+    except StorageError as exc:
+        await update.message.reply_text(f"Ошибка алертов: {exc}", reply_markup=main_keyboard())
+        return ConversationHandler.END
+    await update.message.reply_text(_format_alert_rule(rule), reply_markup=_alerts_menu_keyboard())
+    return WAIT_ALERT_ACTION
+
+
+async def on_alerts_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message:
+        return WAIT_ALERT_ACTION
+    storage = context.bot_data.get("storage")
+    if not isinstance(storage, SupabaseStorage):
+        await update.message.reply_text("Ошибка: хранилище не инициализировано")
+        return ConversationHandler.END
+    chat_id = update.effective_chat.id
+    text = (update.message.text or "").strip().lower()
+    try:
+        rule = storage.get_or_create_alert_rule(chat_id=chat_id)
+    except StorageError as exc:
+        await update.message.reply_text(f"Ошибка алертов: {exc}", reply_markup=main_keyboard())
+        return ConversationHandler.END
+
+    if text == "назад":
+        await update.message.reply_text("Готово.", reply_markup=main_keyboard())
+        return ConversationHandler.END
+    if text == "включить":
+        rule = storage.update_alert_rule(chat_id=chat_id, patch={"is_active": True})
+        await update.message.reply_text(_format_alert_rule(rule), reply_markup=_alerts_menu_keyboard())
+        return WAIT_ALERT_ACTION
+    if text == "выключить":
+        rule = storage.update_alert_rule(chat_id=chat_id, patch={"is_active": False})
+        await update.message.reply_text(_format_alert_rule(rule), reply_markup=_alerts_menu_keyboard())
+        return WAIT_ALERT_ACTION
+    if text == "статус":
+        await update.message.reply_text(_format_alert_rule(rule), reply_markup=_alerts_menu_keyboard())
+        return WAIT_ALERT_ACTION
+    if text == "порог":
+        await update.message.reply_text("Введите порог score от 0 до 1. Пример: 0.6")
+        return WAIT_ALERT_SCORE
+    if text == "типы":
+        await update.message.reply_text(
+            "Введите `all` или список типов через запятую (русские/английские названия).",
+            reply_markup=_threat_types_keyboard(),
+        )
+        return WAIT_ALERT_TYPES
+    if text == "каналы":
+        await update.message.reply_text("Введите `all` или список каналов: @a @b")
+        return WAIT_ALERT_CHANNELS
+    if text == "интервал автообновления":
+        current = int(context.application.bot_data.get("auto_monitor_interval_min") or 0)
+        if current <= 0:
+            current = int(rule.get("auto_monitor_interval_min") or 15)
+        await update.message.reply_text(
+            f"Текущий интервал: {current} мин. Введите новое число минут (1..1440)."
+        )
+        return WAIT_ALERT_INTERVAL
+    if text == "куда отправлять":
+        await update.message.reply_text(
+            "Введите chat_id или @channelusername.\n"
+            "Для текущего чата отправьте: here"
+        )
+        return WAIT_ALERT_TARGET
+
+    await update.message.reply_text("Выберите действие кнопкой.", reply_markup=_alerts_menu_keyboard())
+    return WAIT_ALERT_ACTION
+
+
+async def on_alerts_score(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message:
+        return WAIT_ALERT_SCORE
+    storage = context.bot_data.get("storage")
+    if not isinstance(storage, SupabaseStorage):
+        await update.message.reply_text("Ошибка: хранилище не инициализировано")
+        return ConversationHandler.END
+    try:
+        value = float((update.message.text or "").strip().replace(",", "."))
+    except ValueError:
+        await update.message.reply_text("Введите число от 0 до 1.")
+        return WAIT_ALERT_SCORE
+    if value < 0 or value > 1:
+        await update.message.reply_text("Диапазон: 0..1")
+        return WAIT_ALERT_SCORE
+    rule = storage.update_alert_rule(chat_id=update.effective_chat.id, patch={"min_score": round(value, 4)})
+    await update.message.reply_text(_format_alert_rule(rule), reply_markup=_alerts_menu_keyboard())
+    return WAIT_ALERT_ACTION
+
+
+async def on_alerts_types(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message:
+        return WAIT_ALERT_TYPES
+    storage = context.bot_data.get("storage")
+    if not isinstance(storage, SupabaseStorage):
+        await update.message.reply_text("Ошибка: хранилище не инициализировано")
+        return ConversationHandler.END
+    threat_types = _normalize_threat_types(update.message.text or "")
+    rule = storage.update_alert_rule(chat_id=update.effective_chat.id, patch={"threat_types": threat_types})
+    await update.message.reply_text(_format_alert_rule(rule), reply_markup=_alerts_menu_keyboard())
+    return WAIT_ALERT_ACTION
+
+
+async def on_alerts_channels(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message:
+        return WAIT_ALERT_CHANNELS
+    storage = context.bot_data.get("storage")
+    if not isinstance(storage, SupabaseStorage):
+        await update.message.reply_text("Ошибка: хранилище не инициализировано")
+        return ConversationHandler.END
+    raw = (update.message.text or "").strip()
+    if raw.lower() in {"all", "все", "*"}:
+        rule = storage.update_alert_rule(
+            chat_id=update.effective_chat.id,
+            patch={"channels_mode": "all", "channel_handles": None},
+        )
+        await update.message.reply_text(_format_alert_rule(rule), reply_markup=_alerts_menu_keyboard())
+        return WAIT_ALERT_ACTION
+    handles, _ = _extract_handles_batch(raw)
+    if not handles:
+        await update.message.reply_text("Не нашел валидные каналы. Пример: @peakit_test @svfutg")
+        return WAIT_ALERT_CHANNELS
+    rule = storage.update_alert_rule(
+        chat_id=update.effective_chat.id,
+        patch={"channels_mode": "list", "channel_handles": handles},
+    )
+    await update.message.reply_text(_format_alert_rule(rule), reply_markup=_alerts_menu_keyboard())
+    return WAIT_ALERT_ACTION
+
+
+async def on_alerts_interval(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message:
+        return WAIT_ALERT_INTERVAL
+    raw = (update.message.text or "").strip()
+    try:
+        minutes = int(raw)
+    except ValueError:
+        await update.message.reply_text("Нужно целое число минут (1..1440).")
+        return WAIT_ALERT_INTERVAL
+    if minutes < 1 or minutes > 1440:
+        await update.message.reply_text("Диапазон: 1..1440 минут.")
+        return WAIT_ALERT_INTERVAL
+
+    register_auto_monitor_job(context.application, minutes)
+    storage = context.bot_data.get("storage")
+    if isinstance(storage, SupabaseStorage):
+        try:
+            storage.update_alert_rule(
+                chat_id=update.effective_chat.id,
+                patch={"auto_monitor_interval_min": minutes},
+            )
+        except StorageError:
+            pass
+    await update.message.reply_text(
+        f"Интервал автообновления установлен: {minutes} мин.\n"
+        "Изменение действует сразу и сохранено в БД.",
+        reply_markup=_alerts_menu_keyboard(),
+    )
+    return WAIT_ALERT_ACTION
+
+
+async def on_alerts_target(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message:
+        return WAIT_ALERT_TARGET
+    storage = context.bot_data.get("storage")
+    if not isinstance(storage, SupabaseStorage):
+        await update.message.reply_text("Ошибка: хранилище не инициализировано")
+        return ConversationHandler.END
+    raw = (update.message.text or "").strip()
+    if raw.lower() == "here":
+        raw = str(update.effective_chat.id)
+    if not raw:
+        await update.message.reply_text("Пустое значение. Введите chat_id или @channelusername.")
+        return WAIT_ALERT_TARGET
+    if raw.startswith("@"):
+        target = raw
+    elif raw.lstrip("-").isdigit():
+        target = raw
+    else:
+        await update.message.reply_text("Неверный формат. Нужен chat_id (число) или @channelusername.")
+        return WAIT_ALERT_TARGET
+
+    rule = storage.update_alert_rule(chat_id=update.effective_chat.id, patch={"target_chat": target})
+    await update.message.reply_text(_format_alert_rule(rule), reply_markup=_alerts_menu_keyboard())
+    return WAIT_ALERT_ACTION
 
 
 async def on_analytics_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:

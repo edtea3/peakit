@@ -30,6 +30,8 @@ class Settings:
         self.supabase_timeout_s = int(os.getenv("SUPABASE_TIMEOUT_S", "20").strip() or "20")
         self.supabase_ssl_verify = _env_bool("SUPABASE_SSL_VERIFY", True)
         self.supabase_ca_bundle = os.getenv("SUPABASE_CA_BUNDLE", "").strip() or None
+        self.auto_monitor_enabled = _env_bool("AUTO_MONITOR_ENABLED", False)
+        self.auto_monitor_interval_min = int(os.getenv("AUTO_MONITOR_INTERVAL_MIN", "15").strip() or "15")
 
     def validate(self) -> None:
         if not self.telegram_bot_token:
